@@ -16,7 +16,6 @@ from torch.nn.functional import binary_cross_entropy, cross_entropy, mse_loss
 logger = getLogger(__name__)
 
 
-
 class EntityEmbeddingNN(nn.Module):
     def __init__(
             self,
@@ -34,7 +33,7 @@ class EntityEmbeddingNN(nn.Module):
         self.A = A
         self.B = B
         exp_ = np.exp(-n_uniques * 0.05)
-        self.embed_dims = np.round(5 * (1 - exp_) + 1)
+        self.embed_dims = np.round(5 * (1 - exp_) + 1).astype("int")
         sum_ = np.log(self.embed_dims).sum()
         self.n_layer1 = min(1000,
                             int(A * (n_uniques.size ** 0.5) * sum_ + 1))
@@ -104,9 +103,10 @@ def train_entity_embedding_nn(
             n_class = np.unique(y).size
     nn_params = dict(nn_params)
     nn_params.update(n_class=n_class)
-    entity_embedding_nn = EntityEmbeddingNN(
+    entity_embedding_nn: nn.Module = EntityEmbeddingNN(
         n_uniques, **nn_params
     )
+    entity_embedding_nn.train(True)
     optimizer = torch.optim.Adam(entity_embedding_nn.parameters(), lr=lr)
 
     start = time()
@@ -131,4 +131,5 @@ def train_entity_embedding_nn(
             callback(i, entity_embedding_nn)
     end = time()
     logger.info(f"EntityEmbeddingNN training time = {end - start:.2f}s")
+    entity_embedding_nn.eval()
     return entity_embedding_nn
