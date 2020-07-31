@@ -26,6 +26,7 @@ class EntityEmbeddingNN(nn.Module):
             n_class=2
     ):
         super(EntityEmbeddingNN, self).__init__()
+        self.epoch = 0
         self.n_class = n_class
         self.dropout2 = dropout2
         self.dropout1 = dropout1
@@ -90,6 +91,7 @@ def train_entity_embedding_nn(
         X: np.ndarray,
         y: np.ndarray,
         lr=1e-2, epoch=25,
+        init_model=None,
         callback=None,
         n_class=None,
         nn_params=frozendict()
@@ -103,9 +105,12 @@ def train_entity_embedding_nn(
             n_class = np.unique(y).size
     nn_params = dict(nn_params)
     nn_params.update(n_class=n_class)
-    entity_embedding_nn: nn.Module = EntityEmbeddingNN(
-        n_uniques, **nn_params
-    )
+    if init_model is None:
+        entity_embedding_nn: nn.Module = EntityEmbeddingNN(
+            n_uniques, **nn_params
+        )
+    else:
+        entity_embedding_nn = init_model
     entity_embedding_nn.train(True)
     optimizer = torch.optim.Adam(entity_embedding_nn.parameters(), lr=lr)
 
@@ -114,7 +119,8 @@ def train_entity_embedding_nn(
         y_tensor = torch.from_numpy(y).long()
     else:
         y_tensor = torch.from_numpy(y).double()
-    for i in range(epoch):
+    init_epoch = getattr(entity_embedding_nn, "epoch", 0)
+    for i in range(init_epoch, epoch):
         optimizer.zero_grad()
         _, _, outputs = entity_embedding_nn(X)
         if n_class == 2:
@@ -129,6 +135,7 @@ def train_entity_embedding_nn(
         optimizer.step()
         if callback is not None:
             callback(i, entity_embedding_nn)
+        entity_embedding_nn.epoch = i
     end = time()
     logger.info(f"EntityEmbeddingNN training time = {end - start:.2f}s")
     entity_embedding_nn.eval()
