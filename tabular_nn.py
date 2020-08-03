@@ -3,7 +3,7 @@
 # @Author  : qichun tang
 # @Contact    : tqichun@gmail.com
 from itertools import chain
-from logging import getLogger
+from math import ceil
 from time import time
 from typing import List, Union, Optional
 
@@ -14,8 +14,12 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.utils.multiclass import type_of_target
 from torch import nn
 from torch.nn.functional import cross_entropy, mse_loss
+from xenon.utils.logging_ import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
+
+
+# logger.setLevel(logging.DEBUG)
 
 
 class TabularNN(nn.Module):
@@ -27,12 +31,17 @@ class TabularNN(nn.Module):
             max_layer_width=2056,
             min_layer_width=32,
             dropout_hidden=0.1,
+            af_hidden="relu",
+            af_output="linear",
             dropout_output=0.2,
             layers=(256, 128),
             n_class=2,
             use_bn=True
     ):
         super(TabularNN, self).__init__()
+        self.af_output = af_output
+        self.af_hidden = af_hidden
+        self.epoch = 0
         self.use_bn = use_bn
         assert len(cat_indexes) == len(n_uniques)
         self.layers = layers
@@ -50,9 +59,11 @@ class TabularNN(nn.Module):
                 round(layers[0] * prop_vector_features * np.log10(vector_dim + 10)),
                 min_layer_width, max_layer_width
             ))
+            logger.info(f"numeric_embed_dim = {numeric_embed_dim}")
+
             self.numeric_block = nn.Sequential(
                 nn.Linear(vector_dim, numeric_embed_dim),
-                nn.ReLU(inplace=True)
+                self.get_activate_function(self.af_hidden)
             )
         else:
             numeric_embed_dim = 0
@@ -64,6 +75,7 @@ class TabularNN(nn.Module):
                 nn.Embedding(int(n_unique), int(embed_dim))
                 for n_unique, embed_dim in zip(self.n_uniques, self.embed_dims)
             ])
+            logger.info(f"embed_dims.sum() = {self.embed_dims.sum()}")
         else:
             self.embed_dims = np.array([])
             self.embedding_blocks = None
@@ -75,12 +87,20 @@ class TabularNN(nn.Module):
             in_features = layers_[i - 1]
             out_features = layers_[i]
             dropout_rate = self.dropout_hidden
-            block = self.get_block(in_features, out_features, use_bn=self.use_bn, dropout_rate=dropout_rate)
+            block = self.get_block(
+                in_features, out_features,
+                use_bn=self.use_bn, dropout_rate=dropout_rate, af_name=self.af_hidden)
             deep_net_modules.append(block)
         deep_net_modules.append(
-            self.get_block(layers_[-1], self.n_class, self.use_bn, dropout_rate=self.dropout_output))
+            self.get_block(
+                layers_[-1], self.n_class,
+                self.use_bn, dropout_rate=self.dropout_output, af_name=self.af_output
+            ))
         self.deep_net = nn.Sequential(*deep_net_modules)
-        self.wide_net = self.get_block(after_embed_dim, n_class, use_bn=self.use_bn, dropout_rate=self.dropout_output)
+        self.wide_net = self.get_block(
+            after_embed_dim, n_class,
+            use_bn=self.use_bn, dropout_rate=self.dropout_output, af_name=self.af_output
+        )
         output_modules = []
         if self.n_class > 1:
             output_modules.append(nn.Softmax(dim=1))
@@ -96,12 +116,31 @@ class TabularNN(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 m.bias.data.zero_()
 
-    def get_block(self, in_features, out_features, use_bn, dropout_rate):
+    def get_activate_function(self, af_name: str):
+        af_name = af_name.lower()
+        if af_name == "relu":
+            return nn.ReLU(inplace=True)
+        elif af_name == "leaky_relu":
+            return nn.LeakyReLU(inplace=True)
+        elif af_name == "elu":
+            return nn.ELU(inplace=True)
+        elif af_name == "linear":
+            return nn.Identity()
+        elif af_name == "tanh":
+            return nn.Tanh()
+        elif af_name == "sigmoid":
+            return nn.Sigmoid()
+        elif af_name == "softplus":
+            return nn.Softplus()
+        else:
+            raise ValueError(f"Unknown activate function name {af_name}")
+
+    def get_block(self, in_features, out_features, use_bn, dropout_rate, af_name):
         seq = []
         seq.append(nn.Linear(in_features, out_features))
         if use_bn:
             seq.append(nn.BatchNorm1d(out_features))
-        seq.append(nn.ReLU(inplace=True))
+        seq.append(self.get_activate_function(af_name))
         if dropout_rate > 0:
             seq.append(nn.Dropout(dropout_rate))
         return nn.Sequential(*seq)
@@ -124,14 +163,19 @@ def train_tabular_nn(
         X: np.ndarray,
         y: np.ndarray,
         cat_indexes,
-        X_valid: Optional[np.ndarray]=None,
-        y_valid: Optional[np.ndarray]=None,
+        X_valid: Optional[np.ndarray] = None,
+        y_valid: Optional[np.ndarray] = None,
         lr=1e-2, epoch=25,
+        init_model=None,
         callback=None,
         n_class=None,
-        nn_params=frozendict()
+        nn_params=frozendict(),
+        random_state=1000,
+        batch_size=2048,
+        optimizer="adam",
 ) -> TabularNN:
-    # fixme: tricky operate
+    torch.manual_seed(random_state)
+    np.random.seed(random_state)
     cat_indexes = np.array(cat_indexes, dtype="int")
     n_uniques = (X[:, cat_indexes].max(axis=0) + 1).astype("int")
     vector_dim = X.shape[1] - len(cat_indexes)
@@ -142,41 +186,55 @@ def train_tabular_nn(
             n_class = np.unique(y).size
     nn_params = dict(nn_params)
     nn_params.update(n_class=n_class)
-    tabular_nn: nn.Module = TabularNN(
-        n_uniques, vector_dim, cat_indexes,
-        **nn_params
-    )
-    tabular_nn.train(True)
-    optimizer = torch.optim.Adam(tabular_nn.parameters(), lr=lr)
-
+    if init_model is None:
+        tabular_nn: nn.Module = TabularNN(
+            n_uniques, vector_dim, cat_indexes,
+            **nn_params
+        )
+    else:
+        tabular_nn = init_model
+    if optimizer == "adam":
+        nn_optimizer = torch.optim.Adam(tabular_nn.parameters(), lr=lr)
+    elif optimizer == "sgd":
+        nn_optimizer = torch.optim.SGD(tabular_nn.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer {optimizer}")
     start = time()
     if n_class >= 2:
         y_tensor = torch.from_numpy(y).long()
     else:
         y_tensor = torch.from_numpy(y).double()
-    for i in range(epoch):
-        # todo : batch validate early_stopping warm_start
-        optimizer.zero_grad()
+    init_epoch = getattr(tabular_nn, "epoch", 0)
+    for i in range(init_epoch, epoch):
+        # todo : batch(OK) validate(OK)  warm_start(OK)
+        # todo : early_stopping(OK) multiclass_metric(OK) sample_weight
         tabular_nn.train(True)
-        outputs = tabular_nn(X)
-        if n_class >= 2:
-            loss = cross_entropy(outputs.double(), y_tensor)
-        elif n_class == 1:
-            loss = mse_loss(outputs.flatten().double(), y_tensor)
-        else:
-            raise ValueError
-        loss.backward()
-        optimizer.step()
-        if X_valid is not None and y_valid is not None:
-            y_pred = tabular_nn(X_valid).detach().numpy()
-            if n_class == 2:
-                y_prob = y_pred[:, 1]
-                roc_auc = roc_auc_score(y_valid, y_prob)
-                y_pred = np.argmax(y_pred, axis=1)
-                acc = accuracy_score(y_valid, y_pred)
-                print(f"epoch = {i}, roc_auc = {roc_auc:.3f}, accuracy = {acc:.3f}")
+        # batch
+        permutation = np.random.permutation(len(y))
+        batch_ixs = [permutation[i * batch_size:(i + 1) * batch_size] for i in range(ceil(len(y) / batch_size))]
+        for batch_ix in batch_ixs:
+            nn_optimizer.zero_grad()
+            outputs = tabular_nn(X[batch_ix, :])
+            if n_class >= 2:
+                loss = cross_entropy(outputs.double(), y_tensor[batch_ix])
+            elif n_class == 1:
+                loss = mse_loss(outputs.flatten().double(), y_tensor[batch_ix])
+            else:
+                raise ValueError
+            loss.backward()
+            nn_optimizer.step()
+        # if X_valid is not None and y_valid is not None:
+        #     y_pred = tabular_nn(X_valid).detach().numpy()
+            # if n_class == 2:
+            #     y_prob = y_pred[:, 1]
+            #     roc_auc = roc_auc_score(y_valid, y_prob)
+            #     y_pred = np.argmax(y_pred, axis=1)
+            #     acc = accuracy_score(y_valid, y_pred)
+            #     logger.info(f"epoch = {i}, roc_auc = {roc_auc:.3f}, accuracy = {acc:.3f}")
+
         if callback is not None:
-            callback(i, tabular_nn)
+            if callback(i, tabular_nn) == True:
+                break
     end = time()
     logger.info(f"TabularNN training time = {end - start:.2f}s")
     tabular_nn.eval()

@@ -42,19 +42,23 @@ from lightgbm import LGBMClassifier
 # rf.fit(X_train, y_train)
 # print(rf.score(X_test, y_test))
 
-lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.01)
-lgbm.fit(X_train, y_train)
-print(lgbm.score(X_test, y_test))
-exit(0)
+# lgbm = LGBMClassifier(n_estimators=1000, learning_rate=0.01)
+# lgbm.fit(X_train, y_train)
+# print(lgbm.score(X_test, y_test))
+# exit(0)
 
 train_tabular_nn(
     X_train, y_train, cat_indexes,
     X_valid=X_test, y_valid=y_test,
     nn_params={
         "use_bn": False,
-        "dropout_output": 0,
-        "dropout_hidden": 0.1,
-        "layers": (256, 128)
+        "dropout_output": 0.3,
+        "dropout_hidden": 0.3,
+        "layers": (320, 160),
+        "af_hidden": "tanh"
     },
-    epoch=50
+    batch_size=1024,
+    epoch=32,
+    lr=0.01,
+    optimizer="adam"
 )
